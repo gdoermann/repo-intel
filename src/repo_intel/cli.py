@@ -47,10 +47,11 @@ def cmd_diff_analyze(args):
     analyzer = GitDiffAnalyzer(
         repo_path=args.repo_path,
         max_file_size=args.max_file_size,
-        llm_provider=llm_provider
+        llm_provider=llm_provider,
+        force_regenerate=args.force
     )
 
-    analyzer.analyze_branch_diff(args.base_branch, args.compare_branch)
+    analyzer.analyze_branch_diff(args.base_branch, args.compare_branch, output_dir=args.output_dir)
     analyzer.generate_report(args.base_branch, args.compare_branch, args.output_dir)
 
     logging.info(f"Analysis complete. Report saved to: {args.output_dir}")
@@ -139,6 +140,8 @@ Examples:
                              help='Skip LLM analysis')
     diff_parser.add_argument('--require-llm', action='store_true',
                              help='Fail if no LLM provider is available')
+    diff_parser.add_argument('-f', '--force', action='store_true',
+                             help='Force re-analysis even if reports already exist')
     diff_parser.set_defaults(func=cmd_diff_analyze)
 
     # Markdown Bundle Command

@@ -50,14 +50,18 @@ class ReviewSummary:
     branch_comparison: str
     overall_assessment: str
     llm_provider: Optional[str] = None
+    resumed_files: int = 0  # Track how many files were resumed from existing analysis
 
 
 class GitDiffAnalyzer:
-    def __init__(self, repo_path: str = ".", max_file_size: int = None, llm_provider=None):
+    def __init__(self, repo_path: str = ".", max_file_size: int = None, llm_provider=None,
+                 force_regenerate: bool = False):
         self.repo_path = Path(repo_path)
         self.max_file_size = max_file_size or LLM.DEFAULT_MAX_FILE_SIZE
         self.analyses: List[FileAnalysis] = []
         self.llm_provider = llm_provider
+        self.force_regenerate = force_regenerate
+        self.output_dir = None  # Will be set when generate_report is called
 
     def get_git_diff(self, base_branch: str, compare_branch: str) -> str:
         """Get the diff between two branches"""
@@ -208,9 +212,61 @@ class GitDiffAnalyzer:
 
         return False, ""
 
-    def analyze_branch_diff(self, base_branch: str, compare_branch: str) -> None:
+    def get_safe_filename(self, file_path: str) -> str:
+        """Convert file path to safe filename for individual file reports"""
+        return file_path.replace('/', '_').replace('\\', '_')
+
+    def file_analysis_exists(self, file_path: str) -> bool:
+        """Check if analysis already exists for this file"""
+        if not self.output_dir:
+            return False
+
+        # Check if individual file report exists
+        files_dir = self.output_dir / "files"
+        safe_filename = self.get_safe_filename(file_path)
+        file_report_path = files_dir / f"{safe_filename}.md"
+
+        return file_report_path.exists()
+
+    def load_existing_analysis(self, file_path: str) -> Optional[FileAnalysis]:
+        """Load existing analysis from file if it exists"""
+        if not self.output_dir:
+            return None
+
+        # Try to load from detailed_analysis.json
+        detailed_analysis_path = self.output_dir / "detailed_analysis.json"
+        if detailed_analysis_path.exists():
+            try:
+                with open(detailed_analysis_path, 'r') as f:
+                    analyses_data = json.load(f)
+
+                for analysis_data in analyses_data:
+                    if analysis_data.get('file_path') == file_path:
+                        return FileAnalysis(**analysis_data)
+            except Exception as e:
+                logger.warning(f"Failed to load existing analysis from {detailed_analysis_path}: {e}")
+
+        return None
+
+    def setup_output_directory(self, output_dir: str) -> Path:
+        """Setup output directory and return Path object"""
+        output_path = Path(output_dir).expanduser().resolve()
+        logger.info(f"Setting up output directory: {output_path}")
+        output_path.mkdir(exist_ok=True, parents=True)
+
+        # Create subdirectories
+        (output_path / "files").mkdir(exist_ok=True)
+
+        logger.info(f"Output directory setup: {output_path}")
+        return output_path
+
+    def analyze_branch_diff(self, base_branch: str, compare_branch: str, output_dir: str = None) -> None:
         """Analyze all changes between two branches"""
         logger.info(f"Analyzing diff between {base_branch} and {compare_branch}")
+
+        # Setup output directory early
+        if output_dir:
+            self.output_dir = self.setup_output_directory(output_dir)
 
         # Get list of changed files
         diff_summary = self.get_git_diff(base_branch, compare_branch)
@@ -218,7 +274,20 @@ class GitDiffAnalyzer:
 
         logger.info(f"Found {len(changed_files)} changed files")
 
+        resumed_count = 0
         for status, file_path in changed_files:
+            # Check if analysis already exists and we're not forcing regeneration
+            if not self.force_regenerate and self.file_analysis_exists(file_path):
+                logger.info(f"Resuming: Loading existing analysis for {file_path}")
+                existing_analysis = self.load_existing_analysis(file_path)
+                if existing_analysis:
+                    self.analyses.append(existing_analysis)
+                    resumed_count += 1
+                    continue
+                else:
+                    logger.warning(
+                        f"File report exists but couldn't load analysis data for {file_path}, re-analyzing...")
+
             logger.info(f"Processing {file_path} ({status})")
 
             # Get file diff and content
@@ -273,11 +342,49 @@ class GitDiffAnalyzer:
 
             self.analyses.append(analysis)
 
+            # Save individual file report immediately after analysis
+            if self.output_dir:
+                self.save_individual_file_report(analysis)
+
+        if resumed_count > 0:
+            logger.info(f"Resumed analysis for {resumed_count} files")
+
+    def save_individual_file_report(self, analysis: FileAnalysis) -> None:
+        """Save individual file analysis report immediately"""
+        if not self.output_dir:
+            return
+
+        files_dir = self.output_dir / "files"
+        safe_filename = self.get_safe_filename(analysis.file_path)
+        file_report_path = files_dir / f"{safe_filename}.md"
+
+        try:
+            with open(file_report_path, "w") as f:
+                f.write(f"# {analysis.file_path}\n\n")
+                f.write(f"**Change Type:** {analysis.change_type}\n")
+                f.write(f"**Risk Score:** {analysis.risk_score}/10\n")
+                f.write(f"**Priority:** {analysis.priority}\n")
+                f.write(f"**Lines Added:** {analysis.lines_added}\n")
+                f.write(f"**Lines Removed:** {analysis.lines_removed}\n")
+
+                if analysis.skipped:
+                    f.write(f"**Skipped:** {analysis.skip_reason}\n\n")
+                else:
+                    f.write("\n## Analysis\n\n")
+                    f.write(analysis.llm_feedback)
+                    f.write("\n")
+
+            logger.debug(f"Saved individual report: {file_report_path}")
+        except Exception as e:
+            logger.error(f"Failed to save individual file report for {analysis.file_path}: {e}")
+
     def generate_report(self, base_branch: str, compare_branch: str, output_dir: str = None) -> None:
         """Generate comprehensive review report"""
         output_dir = output_dir or OUTPUT.DEFAULT_DIR
-        output_path = Path(output_dir)
-        output_path.mkdir(exist_ok=True)
+
+        # Setup output directory if not already done
+        if not self.output_dir:
+            self.output_dir = self.setup_output_directory(output_dir)
 
         # Create summary
         total_files = len(self.analyses)
@@ -299,20 +406,17 @@ class GitDiffAnalyzer:
         )
 
         # Save summary
-        with open(output_path / "summary.json", "w") as f:
+        with open(self.output_dir / "summary.json", "w") as f:
             json.dump(asdict(summary), f, indent=2)
 
         # Save detailed analysis
-        with open(output_path / "detailed_analysis.json", "w") as f:
+        with open(self.output_dir / "detailed_analysis.json", "w") as f:
             json.dump([asdict(a) for a in self.analyses], f, indent=2)
 
         # Generate markdown report
-        self.generate_markdown_report(output_path, summary)
+        self.generate_markdown_report(self.output_dir, summary)
 
-        # Generate individual file reports
-        self.generate_file_reports(output_path)
-
-        logger.info(f"Review report generated in {output_path}")
+        logger.info(f"Review report generated in {self.output_dir}")
 
     def generate_markdown_report(self, output_path: Path, summary: ReviewSummary) -> None:
         """Generate a markdown summary report"""
@@ -326,7 +430,12 @@ class GitDiffAnalyzer:
             f.write(f"- Total files changed: {summary.total_files}\n")
             f.write(f"- Files analyzed: {summary.files_analyzed}\n")
             f.write(f"- Files skipped: {summary.files_skipped}\n")
-            f.write(f"- High-risk files: {summary.high_risk_files}\n\n")
+            f.write(f"- High-risk files: {summary.high_risk_files}\n")
+
+            if summary.resumed_files > 0:
+                f.write(f"- Files resumed from previous run: {summary.resumed_files}\n")
+
+            f.write("\n")
 
             # Sort by priority and risk score
             sorted_analyses = sorted(
@@ -341,7 +450,8 @@ class GitDiffAnalyzer:
                 if priority_files:
                     f.write(f"### {priority.title()} Priority ({len(priority_files)} files)\n\n")
                     for analysis in priority_files:
-                        f.write(f"- [{analysis.file_path}](files/{analysis.file_path.replace('/', '_')}.md) ")
+                        safe_filename = self.get_safe_filename(analysis.file_path)
+                        f.write(f"- [{analysis.file_path}](files/{safe_filename}.md) ")
                         f.write(
                             f"(Risk: {analysis.risk_score}/10, +{analysis.lines_added}/-{analysis.lines_removed})\n")
                     f.write("\n")
@@ -354,7 +464,9 @@ class GitDiffAnalyzer:
                     f.write(f"- {analysis.file_path}: {analysis.skip_reason}\n")
 
     def generate_file_reports(self, output_path: Path) -> None:
-        """Generate individual file analysis reports"""
+        """Generate individual file analysis reports (legacy method - files are now saved immediately)"""
+        # This method is now mostly redundant since we save files immediately
+        # but keeping for backwards compatibility
         files_dir = output_path / "files"
         files_dir.mkdir(exist_ok=True)
 
@@ -362,21 +474,12 @@ class GitDiffAnalyzer:
             if analysis.skipped:
                 continue
 
-            # Create safe filename
-            safe_filename = analysis.file_path.replace('/', '_').replace('\\', '_')
+            safe_filename = self.get_safe_filename(analysis.file_path)
             file_report_path = files_dir / f"{safe_filename}.md"
 
-            with open(file_report_path, "w") as f:
-                f.write(f"# {analysis.file_path}\n\n")
-                f.write(f"**Change Type:** {analysis.change_type}\n")
-                f.write(f"**Risk Score:** {analysis.risk_score}/10\n")
-                f.write(f"**Priority:** {analysis.priority}\n")
-                f.write(f"**Lines Added:** {analysis.lines_added}\n")
-                f.write(f"**Lines Removed:** {analysis.lines_removed}\n\n")
-
-                f.write("## Analysis\n\n")
-                f.write(analysis.llm_feedback)
-                f.write("\n")
+            # Only create if it doesn't exist (since we save immediately now)
+            if not file_report_path.exists():
+                self.save_individual_file_report(analysis)
 
 
 def main():
@@ -392,6 +495,8 @@ def main():
     parser.add_argument("--llm-provider", choices=['openai', 'anthropic', 'local'],
                         help="LLM provider to use", default=settings.LLM.PROVIDER)
     parser.add_argument("--no-llm", action="store_true", help="Skip LLM analysis")
+    parser.add_argument("-f", "--force", action="store_true",
+                        help="Force regeneration of all files, ignoring existing analysis")
 
     args = parser.parse_args()
 
@@ -407,8 +512,8 @@ def main():
         except Exception as e:
             logger.warning(f"Failed to setup LLM provider: {e}. Continuing without LLM analysis.")
 
-    analyzer = GitDiffAnalyzer(args.repo_path, args.max_file_size, llm_provider)
-    analyzer.analyze_branch_diff(args.base_branch, args.compare_branch)
+    analyzer = GitDiffAnalyzer(args.repo_path, args.max_file_size, llm_provider, args.force)
+    analyzer.analyze_branch_diff(args.base_branch, args.compare_branch, args.output_dir)
     analyzer.generate_report(args.base_branch, args.compare_branch, args.output_dir)
 
 
