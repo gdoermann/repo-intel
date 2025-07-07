@@ -57,8 +57,8 @@ MARKDOWN.EXCLUDE_PATTERNS = env.list('MARKDOWN_EXCLUDE_PATTERNS', default=[
 
 # AWS Configuration for Glue
 AWS = AttrDict()
-AWS.REGION = env.str('AWS_REGION', default=None)
-AWS.PROFILE = env.str('AWS_PROFILE', default=None)
+AWS.REGION = env.str('AWS_REGION', default='us-east-1')
+AWS.PROFILE = env.str('AWS_PROFILE', default='default')
 
 # Glue Bundle Configuration
 GLUE = AttrDict()

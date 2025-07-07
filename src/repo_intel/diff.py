@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional
 
+from repo_intel import settings
 from .llm import create_llm_provider
 from .settings import LLM, GIT, OUTPUT
 
@@ -386,10 +387,10 @@ def main():
     parser.add_argument("--repo-path", default=str(GIT.DEFAULT_REPO_PATH), help="Path to git repository")
     parser.add_argument("--max-file-size", type=int, default=LLM.DEFAULT_MAX_FILE_SIZE,
                         help="Maximum combined file size for LLM analysis")
-    parser.add_argument("--output-dir", default=OUTPUT.DEFAULT_DIR,
+    parser.add_argument("-o", "--output-dir", default=OUTPUT.DEFAULT_DIR,
                         help="Output directory for reports")
     parser.add_argument("--llm-provider", choices=['openai', 'anthropic', 'local'],
-                        help="LLM provider to use")
+                        help="LLM provider to use", default=settings.LLM.PROVIDER)
     parser.add_argument("--no-llm", action="store_true", help="Skip LLM analysis")
 
     args = parser.parse_args()

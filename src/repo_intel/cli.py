@@ -131,7 +131,7 @@ Examples:
                              help='Path to git repository')
     diff_parser.add_argument('--max-file-size', type=int, default=LLM.DEFAULT_MAX_FILE_SIZE,
                              help='Maximum combined file size for LLM analysis')
-    diff_parser.add_argument('--output-dir', default=OUTPUT.DEFAULT_DIR,
+    diff_parser.add_argument('-o', '--output-dir', default=OUTPUT.DEFAULT_DIR,
                              help='Output directory for reports')
     diff_parser.add_argument('--llm-provider', choices=['openai', 'anthropic', 'local'],
                              help='Force specific LLM provider')
