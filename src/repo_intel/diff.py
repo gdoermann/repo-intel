@@ -304,7 +304,7 @@ class GitDiffAnalyzer:
                     logger.warning(
                         f"File report exists but couldn't load analysis data for {file_path}, re-analyzing...")
 
-            logger.info(f"Processing {file_path} ({status})")
+            logger.debug(f"Processing {file_path} ({status})")
 
             # Get file diff and content
             diff_content = self.get_file_diff(file_path, base_branch, compare_branch)
