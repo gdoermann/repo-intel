@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional
 
+from tqdm import tqdm
+
 from repo_intel import settings
 from .llm import create_llm_provider
 from .settings import LLM, GIT, OUTPUT
@@ -233,7 +235,20 @@ class GitDiffAnalyzer:
         if not self.output_dir:
             return None
 
-        # Try to load from detailed_analysis.json
+        # First try to load from individual file JSON
+        files_dir = self.output_dir / "files"
+        safe_filename = self.get_safe_filename(file_path)
+        json_report_path = files_dir / f"{safe_filename}.json"
+
+        if json_report_path.exists():
+            try:
+                with open(json_report_path, 'r') as f:
+                    analysis_data = json.load(f)
+                return FileAnalysis(**analysis_data)
+            except Exception as e:
+                logger.warning(f"Failed to load individual analysis from {json_report_path}: {e}")
+
+        # Fallback to detailed_analysis.json
         detailed_analysis_path = self.output_dir / "detailed_analysis.json"
         if detailed_analysis_path.exists():
             try:
@@ -273,6 +288,7 @@ class GitDiffAnalyzer:
         changed_files = self.parse_diff_summary(diff_summary)
 
         logger.info(f"Found {len(changed_files)} changed files")
+        changed_files = tqdm(changed_files, desc="Analyzing files", unit="file")
 
         resumed_count = 0
         for status, file_path in changed_files:
@@ -349,35 +365,6 @@ class GitDiffAnalyzer:
         if resumed_count > 0:
             logger.info(f"Resumed analysis for {resumed_count} files")
 
-    def save_individual_file_report(self, analysis: FileAnalysis) -> None:
-        """Save individual file analysis report immediately"""
-        if not self.output_dir:
-            return
-
-        files_dir = self.output_dir / "files"
-        safe_filename = self.get_safe_filename(analysis.file_path)
-        file_report_path = files_dir / f"{safe_filename}.md"
-
-        try:
-            with open(file_report_path, "w") as f:
-                f.write(f"# {analysis.file_path}\n\n")
-                f.write(f"**Change Type:** {analysis.change_type}\n")
-                f.write(f"**Risk Score:** {analysis.risk_score}/10\n")
-                f.write(f"**Priority:** {analysis.priority}\n")
-                f.write(f"**Lines Added:** {analysis.lines_added}\n")
-                f.write(f"**Lines Removed:** {analysis.lines_removed}\n")
-
-                if analysis.skipped:
-                    f.write(f"**Skipped:** {analysis.skip_reason}\n\n")
-                else:
-                    f.write("\n## Analysis\n\n")
-                    f.write(analysis.llm_feedback)
-                    f.write("\n")
-
-            logger.debug(f"Saved individual report: {file_report_path}")
-        except Exception as e:
-            logger.error(f"Failed to save individual file report for {analysis.file_path}: {e}")
-
     def generate_report(self, base_branch: str, compare_branch: str, output_dir: str = None) -> None:
         """Generate comprehensive review report"""
         output_dir = output_dir or OUTPUT.DEFAULT_DIR
@@ -417,6 +404,43 @@ class GitDiffAnalyzer:
         self.generate_markdown_report(self.output_dir, summary)
 
         logger.info(f"Review report generated in {self.output_dir}")
+
+    def save_individual_file_report(self, analysis: FileAnalysis) -> None:
+        """Save individual file analysis report immediately"""
+        if not self.output_dir:
+            return
+
+        files_dir = self.output_dir / "files"
+        safe_filename = self.get_safe_filename(analysis.file_path)
+        file_report_path = files_dir / f"{safe_filename}.md"
+
+        # Also save JSON data for resuming
+        json_report_path = files_dir / f"{safe_filename}.json"
+
+        try:
+            # Save markdown report
+            with open(file_report_path, "w") as f:
+                f.write(f"# {analysis.file_path}\n\n")
+                f.write(f"**Change Type:** {analysis.change_type}\n")
+                f.write(f"**Risk Score:** {analysis.risk_score}/10\n")
+                f.write(f"**Priority:** {analysis.priority}\n")
+                f.write(f"**Lines Added:** {analysis.lines_added}\n")
+                f.write(f"**Lines Removed:** {analysis.lines_removed}\n")
+
+                if analysis.skipped:
+                    f.write(f"**Skipped:** {analysis.skip_reason}\n\n")
+                else:
+                    f.write("\n## Analysis\n\n")
+                    f.write(analysis.llm_feedback)
+                    f.write("\n")
+
+            # Save JSON data for resuming
+            with open(json_report_path, "w") as f:
+                json.dump(asdict(analysis), f, indent=2)
+
+            logger.debug(f"Saved individual report: {file_report_path}")
+        except Exception as e:
+            logger.error(f"Failed to save individual file report for {analysis.file_path}: {e}")
 
     def generate_markdown_report(self, output_path: Path, summary: ReviewSummary) -> None:
         """Generate a markdown summary report"""

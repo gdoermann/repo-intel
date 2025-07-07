@@ -2,3 +2,4 @@ attrdict3
 boto3
 requests
 environs
+tqdm
