@@ -3,6 +3,7 @@
 Repo Intel - Repository Analysis CLI
 
 Main command-line interface for repository intelligence tools.
+Enhanced with merge request summary generation.
 """
 
 import argparse
@@ -55,6 +56,55 @@ def cmd_diff_analyze(args):
     analyzer.generate_report(args.base_branch, args.compare_branch, args.output_dir)
 
     logging.info(f"Analysis complete. Report saved to: {args.output_dir}")
+
+
+def cmd_mr_summary(args):
+    """Generate merge request summary only"""
+    from .diff import GitDiffAnalyzer
+    from .llm import create_llm_provider, get_available_providers
+
+    # Setup LLM provider
+    llm_provider = None
+    if not args.no_llm:
+        try:
+            available = get_available_providers()
+            if not any(available.values()):
+                logging.warning("No LLM providers configured. Generating basic summary.")
+            else:
+                llm_provider = create_llm_provider(args.llm_provider)
+                logging.info(f"Using LLM provider: {type(llm_provider).__name__}")
+        except Exception as e:
+            logging.error(f"Failed to setup LLM provider: {e}")
+            if args.require_llm:
+                sys.exit(1)
+            logging.warning("Generating basic summary without LLM")
+
+    # Create analyzer
+    analyzer = GitDiffAnalyzer(
+        repo_path=args.repo_path,
+        max_file_size=args.max_file_size,
+        llm_provider=llm_provider,
+        force_regenerate=False
+    )
+
+    # Run quick analysis (just get file statistics, no detailed LLM analysis)
+    analyzer.analyze_branch_diff(args.base_branch, args.compare_branch, output_dir=None)
+
+    # Generate summary
+    summary = analyzer.generate_mr_summary(args.base_branch, args.compare_branch)
+
+    # Output summary
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(summary)
+        logging.info(f"MR summary saved to: {args.output}")
+    else:
+        print("\n" + "=" * 60)
+        print("MERGE REQUEST SUMMARY")
+        print("=" * 60)
+        print(f"\n{summary}\n")
+        print("=" * 60)
+        print("\nCopy the text above to your merge request description.")
 
 
 def cmd_markdown_bundle(args):
@@ -111,6 +161,7 @@ def create_parser():
         epilog="""
 Examples:
   repo-intel diff-analyze main staging
+  repo-intel mr-summary main feature/new-api
   repo-intel markdown-bundle src/ -o code_bundle.md
   repo-intel glue-document -d my_database
   repo-intel list-providers
@@ -143,6 +194,23 @@ Examples:
     diff_parser.add_argument('-f', '--force', action='store_true',
                              help='Force re-analysis even if reports already exist')
     diff_parser.set_defaults(func=cmd_diff_analyze)
+
+    # MR Summary Command
+    mr_parser = subparsers.add_parser('mr-summary', aliases=['mrs'], help='Generate merge request summary')
+    mr_parser.add_argument('base_branch', help='Base branch to compare from')
+    mr_parser.add_argument('compare_branch', help='Branch to compare to')
+    mr_parser.add_argument('--repo-path', default=str(GIT.DEFAULT_REPO_PATH),
+                           help='Path to git repository')
+    mr_parser.add_argument('--max-file-size', type=int, default=LLM.DEFAULT_MAX_FILE_SIZE,
+                           help='Maximum combined file size for analysis')
+    mr_parser.add_argument('-o', '--output', help='Output file for summary (prints to console if not specified)')
+    mr_parser.add_argument('--llm-provider', choices=['openai', 'anthropic', 'local'],
+                           help='Force specific LLM provider')
+    mr_parser.add_argument('--no-llm', action='store_true',
+                           help='Generate basic summary without LLM')
+    mr_parser.add_argument('--require-llm', action='store_true',
+                           help='Fail if no LLM provider is available')
+    mr_parser.set_defaults(func=cmd_mr_summary)
 
     # Markdown Bundle Command
     bundle_parser = subparsers.add_parser('markdown-bundle', aliases=['mb'], help='Create markdown code bundle')

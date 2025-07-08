@@ -2,6 +2,7 @@
 LLM Integration for Repo Intel
 
 This module provides LLM integration using environment-based configuration.
+Enhanced with merge request summary generation capabilities.
 """
 
 import json
@@ -24,6 +25,31 @@ class LLMProvider(ABC):
                             file_content: str, change_type: str) -> str:
         """Analyze code change and return feedback"""
         pass
+
+    def generate_mr_summary(self, context: str) -> str:
+        """Generate a merge request summary. Default implementation uses analyze_code_change."""
+        prompt = f"""
+Based on the following git branch comparison data, write a concise 2-3 sentence summary 
+suitable for a merge request description. Focus on:
+- What functionality was changed, added, or removed
+- The scope and impact of changes
+- Any notable improvements or fixes
+
+Write in a professional tone suitable for team review. Avoid technical jargon where possible.
+
+Context:
+{context}
+
+Provide ONLY the summary paragraph, no additional formatting or explanations.
+"""
+
+        try:
+            return self.analyze_code_change(
+                "MERGE_REQUEST_SUMMARY", prompt, "", "SUMMARY"
+            ).strip()
+        except Exception as e:
+            logger.error(f"Failed to generate MR summary: {e}")
+            return "Unable to generate summary - manual description required."
 
 
 class OpenAIProvider(LLMProvider):
@@ -82,6 +108,44 @@ class OpenAIProvider(LLMProvider):
             logger.error(f"Unexpected error with OpenAI: {e}")
             return f"Error analyzing with OpenAI: {str(e)}"
 
+    def generate_mr_summary(self, context: str) -> str:
+        """Generate merge request summary using OpenAI"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        if self.organization:
+            headers["OpenAI-Organization"] = self.organization
+
+        prompt = self._create_mr_summary_prompt(context)
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system",
+                 "content": "You are a technical writer specializing in clear, concise summaries of code changes for development teams."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 200,  # Shorter for summaries
+            "temperature": 0.3  # Lower temperature for consistency
+        }
+
+        try:
+            response = requests.post(
+                self.base_url,
+                headers=headers,
+                json=payload,
+                timeout=OPENAI.TIMEOUT
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            return result["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"Failed to generate OpenAI MR summary: {e}")
+            return super().generate_mr_summary(context)
+
     def _create_review_prompt(self, file_path: str, diff_content: str,
                               file_content: str, change_type: str) -> str:
         return f"""
@@ -108,6 +172,23 @@ Please provide:
 5. **Approval**: Approve/Needs Work/Reject with brief explanation
 
 Focus on: correctness, security, performance, maintainability, and adherence to best practices.
+"""
+
+    def _create_mr_summary_prompt(self, context: str) -> str:
+        return f"""
+Based on the following git branch comparison, write a concise 2-3 sentence summary for a merge request description.
+
+Requirements:
+- Focus on what functionality was changed, added, or removed
+- Mention the scope and impact of changes
+- Use professional language suitable for team review
+- Avoid excessive technical details
+- Highlight any significant improvements or fixes
+
+Context:
+{context}
+
+Write ONLY the summary paragraph, no formatting or additional text.
 """
 
 
@@ -154,6 +235,34 @@ class AnthropicProvider(LLMProvider):
             logger.error(f"Unexpected error with Anthropic: {e}")
             return f"Error analyzing with Anthropic: {str(e)}"
 
+    def generate_mr_summary(self, context: str) -> str:
+        """Generate merge request summary using Anthropic Claude"""
+        headers = {
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01"
+        }
+
+        prompt = self._create_mr_summary_prompt(context)
+
+        payload = {
+            "model": self.model,
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }
+
+        try:
+            response = requests.post(self.base_url, headers=headers, json=payload, timeout=90)
+            response.raise_for_status()
+
+            result = response.json()
+            return result["content"][0]["text"].strip()
+        except Exception as e:
+            logger.error(f"Failed to generate Anthropic MR summary: {e}")
+            return super().generate_mr_summary(context)
+
     def _create_review_prompt(self, file_path: str, diff_content: str,
                               file_content: str, change_type: str) -> str:
         return f"""
@@ -183,6 +292,23 @@ Please provide a structured review with:
 7. **Recommendation**: Approve/Request Changes/Reject
 
 Be specific and actionable in your feedback.
+"""
+
+    def _create_mr_summary_prompt(self, context: str) -> str:
+        return f"""
+Based on the git branch comparison data below, write a professional 2-3 sentence summary suitable for a merge request description.
+
+Focus on:
+- What functionality was changed, added, or removed
+- The scope and impact of changes  
+- Any notable improvements, bug fixes, or new features
+
+Write in a clear, professional tone suitable for development team review.
+
+Context:
+{context}
+
+Provide only the summary paragraph with no additional formatting.
 """
 
 
@@ -219,6 +345,28 @@ class LocalLLMProvider(LLMProvider):
             logger.error(f"Unexpected error with local LLM: {e}")
             return f"Error analyzing with local LLM: {str(e)}"
 
+    def generate_mr_summary(self, context: str) -> str:
+        """Generate merge request summary using local LLM"""
+        url = f"{self.base_url}/api/generate"
+
+        prompt = self._create_mr_summary_prompt(context)
+
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False
+        }
+
+        try:
+            response = requests.post(url, json=payload, timeout=120)
+            response.raise_for_status()
+
+            result = response.json()
+            return result["response"].strip()
+        except Exception as e:
+            logger.error(f"Failed to generate local LLM MR summary: {e}")
+            return super().generate_mr_summary(context)
+
     def _create_review_prompt(self, file_path: str, diff_content: str,
                               file_content: str, change_type: str) -> str:
         return f"""
@@ -242,6 +390,18 @@ Please review this code change and provide:
 6. Overall assessment (approve/needs work/reject)
 
 Be concise but thorough in your analysis.
+"""
+
+    def _create_mr_summary_prompt(self, context: str) -> str:
+        return f"""
+Based on the following git branch comparison data, write a brief 2-3 sentence summary for a merge request description.
+
+Focus on what was changed and the impact. Be professional and concise.
+
+Context:
+{context}
+
+Summary:
 """
 
 
@@ -345,6 +505,30 @@ if __name__ == "__main__":
         )
 
         print("Analysis result:", result)
+
+        # Example MR summary
+        sample_context = """
+Branch Comparison: main -> feature/calculator
+
+Commit Messages:
+- Add price calculation utility
+- Update test coverage
+
+File Changes Summary:
+- Core Logic Files: 2
+- Test Files: 1
+
+Code Statistics:
+- Total Lines Added: 25
+- Total Lines Removed: 3
+
+Key File Changes:
+utils/calculator.py (A, +15/-0)
+tests/test_calculator.py (M, +10/-3)
+"""
+
+        summary = provider.generate_mr_summary(sample_context)
+        print("MR Summary:", summary)
 
     except Exception as e:
         print(f"Error: {e}")

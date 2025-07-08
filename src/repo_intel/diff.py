@@ -3,7 +3,8 @@
 Git Branch Diff Analyzer for LLM Code Review
 
 This script compares two git branches file by file, analyzes each change
-with an LLM, and generates a comprehensive code review report.
+with an LLM, and generates a comprehensive code review report including
+a paragraph summary suitable for merge request descriptions.
 """
 
 import argparse
@@ -51,6 +52,7 @@ class ReviewSummary:
     timestamp: str
     branch_comparison: str
     overall_assessment: str
+    mr_summary: str = ""  # New field for merge request summary
     llm_provider: Optional[str] = None
     resumed_files: int = 0  # Track how many files were resumed from existing analysis
 
@@ -108,6 +110,21 @@ class GitDiffAnalyzer:
             return result.stdout
         except subprocess.CalledProcessError:
             # File might not exist in the branch (new file)
+            return ""
+
+    def get_commit_messages(self, base_branch: str, compare_branch: str) -> str:
+        """Get commit messages between branches for context"""
+        try:
+            result = subprocess.run(
+                ['git', 'log', f'{base_branch}..{compare_branch}', '--oneline', '--no-merges'],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to get commit messages: {e}")
             return ""
 
     def parse_diff_summary(self, diff_output: str) -> List[Tuple[str, str]]:
@@ -194,6 +211,179 @@ class GitDiffAnalyzer:
         else:
             # No LLM provider configured
             return "No LLM analysis - provider not configured"
+
+    def generate_mr_summary(self, base_branch: str, compare_branch: str) -> str:
+        """Generate a paragraph summary suitable for merge request descriptions"""
+        if not self.llm_provider:
+            return self._generate_basic_mr_summary(base_branch, compare_branch)
+
+        try:
+            return self._generate_llm_mr_summary(base_branch, compare_branch)
+        except Exception as e:
+            logger.warning(f"Failed to generate LLM summary, falling back to basic: {e}")
+            return self._generate_basic_mr_summary(base_branch, compare_branch)
+
+    def _generate_basic_mr_summary(self, base_branch: str, compare_branch: str) -> str:
+        """Generate a basic summary without LLM"""
+        total_files = len(self.analyses)
+        files_by_type = {}
+        total_additions = 0
+        total_deletions = 0
+
+        for analysis in self.analyses:
+            if analysis.skipped:
+                continue
+
+            change_type = analysis.change_type
+            if change_type not in files_by_type:
+                files_by_type[change_type] = 0
+            files_by_type[change_type] += 1
+
+            total_additions += analysis.lines_added
+            total_deletions += analysis.lines_removed
+
+        # Get commit messages for context
+        commit_messages = self.get_commit_messages(base_branch, compare_branch)
+
+        # Build summary
+        summary_parts = []
+
+        # Main description
+        if files_by_type.get('M', 0) > 0:
+            summary_parts.append(f"Modified {files_by_type['M']} file(s)")
+        if files_by_type.get('A', 0) > 0:
+            summary_parts.append(f"added {files_by_type['A']} new file(s)")
+        if files_by_type.get('D', 0) > 0:
+            summary_parts.append(f"deleted {files_by_type['D']} file(s)")
+        if any(k.startswith('R') for k in files_by_type.keys()):
+            renamed_count = sum(v for k, v in files_by_type.items() if k.startswith('R'))
+            summary_parts.append(f"renamed {renamed_count} file(s)")
+
+        change_desc = ", ".join(summary_parts) if summary_parts else "No significant changes detected"
+
+        # Risk assessment
+        high_risk_count = len([a for a in self.analyses if a.priority in ['high', 'critical']])
+        if high_risk_count > 0:
+            risk_note = f" This merge includes {high_risk_count} high-risk file(s) that require careful review."
+        else:
+            risk_note = " All changes appear to be low to medium risk."
+
+        # Code stats
+        stats = f"Overall changes: +{total_additions}/-{total_deletions} lines across {total_files} files."
+
+        return f"This merge request {change_desc}.{risk_note} {stats}"
+
+    def _generate_llm_mr_summary(self, base_branch: str, compare_branch: str) -> str:
+        """Generate an LLM-powered summary for merge requests"""
+        # Prepare context for LLM
+        context = self._prepare_summary_context(base_branch, compare_branch)
+
+        try:
+            summary = self.llm_provider.generate_mr_summary(context)
+            return summary
+        except AttributeError:
+            # Fallback if the LLM provider doesn't have generate_mr_summary method
+            return self._generate_llm_summary_with_generic_method(context)
+
+    def _generate_llm_summary_with_generic_method(self, context: str) -> str:
+        """Generate summary using the standard analyze_code_change method"""
+        prompt = f"""
+        Based on the following git branch comparison data, write a concise 2-3 sentence summary 
+        suitable for a merge request description. Focus on what was changed and the overall impact.
+        
+        {context}
+        
+        Please provide ONLY the summary paragraph, no additional formatting or explanations.
+        """
+
+        try:
+            return self.llm_provider.analyze_code_change(
+                "MERGE_REQUEST_SUMMARY", prompt, "", "SUMMARY"
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate LLM summary: {e}")
+            raise
+
+    def _prepare_summary_context(self, base_branch: str, compare_branch: str) -> str:
+        """Prepare context data for LLM summary generation"""
+        # Get commit messages
+        commit_messages = self.get_commit_messages(base_branch, compare_branch)
+
+        # Categorize files and changes
+        files_by_category = {
+            'core_logic': [],
+            'tests': [],
+            'config': [],
+            'documentation': [],
+            'other': []
+        }
+
+        total_additions = 0
+        total_deletions = 0
+        high_risk_files = []
+
+        for analysis in self.analyses:
+            if analysis.skipped:
+                continue
+
+            file_path = analysis.file_path.lower()
+
+            # Categorize files
+            if 'test' in file_path:
+                category = 'tests'
+            elif any(ext in file_path for ext in ['.md', '.txt', '.rst']):
+                category = 'documentation'
+            elif any(cfg in file_path for cfg in ['config', 'docker', 'requirements', 'package.json']):
+                category = 'config'
+            elif any(ext in file_path for ext in ['.py', '.js', '.ts', '.java', '.go']):
+                category = 'core_logic'
+            else:
+                category = 'other'
+
+            files_by_category[category].append({
+                'path': analysis.file_path,
+                'change_type': analysis.change_type,
+                'lines_added': analysis.lines_added,
+                'lines_removed': analysis.lines_removed,
+                'priority': analysis.priority
+            })
+
+            total_additions += analysis.lines_added
+            total_deletions += analysis.lines_removed
+
+            if analysis.priority in ['high', 'critical']:
+                high_risk_files.append(analysis.file_path)
+
+        # Build context
+        context = f"""
+Branch Comparison: {base_branch} -> {compare_branch}
+
+Commit Messages:
+{commit_messages or 'No commit messages available'}
+
+File Changes Summary:
+- Core Logic Files: {len(files_by_category['core_logic'])}
+- Test Files: {len(files_by_category['tests'])}
+- Configuration Files: {len(files_by_category['config'])}
+- Documentation: {len(files_by_category['documentation'])}
+- Other Files: {len(files_by_category['other'])}
+
+Code Statistics:
+- Total Lines Added: {total_additions}
+- Total Lines Removed: {total_deletions}
+- High Risk Files: {len(high_risk_files)}
+
+Key File Changes:
+"""
+
+        # Add details for significant files
+        for category, files in files_by_category.items():
+            if files and category in ['core_logic', 'config']:
+                context += f"\n{category.replace('_', ' ').title()}:\n"
+                for file_info in files[:5]:  # Limit to top 5 files per category
+                    context += f"  - {file_info['path']} ({file_info['change_type']}, +{file_info['lines_added']}/-{file_info['lines_removed']})\n"
+
+        return context
 
     def should_skip_file(self, file_path: str, diff_content: str, file_content: str) -> Tuple[bool, str]:
         """Determine if a file should be skipped due to size or other criteria"""
@@ -373,6 +563,10 @@ class GitDiffAnalyzer:
         if not self.output_dir:
             self.output_dir = self.setup_output_directory(output_dir)
 
+        # Generate MR summary
+        logger.info("Generating merge request summary...")
+        mr_summary = self.generate_mr_summary(base_branch, compare_branch)
+
         # Create summary
         total_files = len(self.analyses)
         files_analyzed = len([a for a in self.analyses if not a.skipped])
@@ -389,6 +583,7 @@ class GitDiffAnalyzer:
             timestamp=datetime.now().isoformat(),
             branch_comparison=f"{base_branch}...{compare_branch}",
             overall_assessment="Generated by automated analysis",
+            mr_summary=mr_summary,
             llm_provider=llm_provider_name
         )
 
@@ -400,10 +595,15 @@ class GitDiffAnalyzer:
         with open(self.output_dir / "detailed_analysis.json", "w") as f:
             json.dump([asdict(a) for a in self.analyses], f, indent=2)
 
+        # Save MR summary separately for easy access
+        with open(self.output_dir / "mr_summary.txt", "w") as f:
+            f.write(mr_summary)
+
         # Generate markdown report
         self.generate_markdown_report(self.output_dir, summary)
 
         logger.info(f"Review report generated in {self.output_dir}")
+        logger.info(f"MR Summary: {mr_summary}")
 
     def save_individual_file_report(self, analysis: FileAnalysis) -> None:
         """Save individual file analysis report immediately"""
@@ -450,7 +650,12 @@ class GitDiffAnalyzer:
             f.write(f"**Generated:** {summary.timestamp}\n")
             f.write(f"**LLM Provider:** {summary.llm_provider}\n\n")
 
-            f.write("## Summary\n\n")
+            # Add MR Summary section
+            f.write("## Merge Request Summary\n\n")
+            f.write(f"{summary.mr_summary}\n\n")
+            f.write("*This summary can be copied directly to your merge request description.*\n\n")
+
+            f.write("## Analysis Summary\n\n")
             f.write(f"- Total files changed: {summary.total_files}\n")
             f.write(f"- Files analyzed: {summary.files_analyzed}\n")
             f.write(f"- Files skipped: {summary.files_skipped}\n")
